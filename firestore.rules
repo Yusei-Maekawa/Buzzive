@@ -1,0 +1,263 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ──────────────────────────────────────────────
+
+    function authed() {
+      return request.auth != null;
+    }
+
+    function memberPath(roomId) {
+      return /databases/$(database)/documents/rooms/$(roomId)/members/$(request.auth.uid);
+    }
+
+    function isMember(roomId) {
+      return authed() && exists(memberPath(roomId));
+    }
+
+    function roomDoc(roomId) {
+      return get(/databases/$(database)/documents/rooms/$(roomId));
+    }
+
+    function roomData(roomId) {
+      return roomDoc(roomId).data;
+    }
+
+    function isHost(roomId) {
+      return authed() && roomData(roomId).hostId == request.auth.uid;
+    }
+
+    function isQuestioner(roomId) {
+      return authed() && roomData(roomId).currentQuestionerId == request.auth.uid;
+    }
+
+    function isWaitingRoom(roomId) {
+      return authed() && roomData(roomId).status == 'waiting';
+    }
+
+    function validQuestionText(text) {
+      return text is string && text.size() > 0 && text.size() <= 500;
+    }
+
+    function validRoomSettings(settings) {
+      return settings.keys().hasAll(['totalQuestions', 'correctPoint', 'wrongPoint', 'questionerMode'])
+        && settings.totalQuestions is int
+        && settings.totalQuestions >= 1
+        && settings.totalQuestions <= 100
+        && settings.correctPoint is int
+        && settings.correctPoint >= 1
+        && settings.correctPoint <= 100
+        && settings.wrongPoint is int
+        && settings.wrongPoint >= -50
+        && settings.wrongPoint <= 0
+        && settings.questionerMode in ['fixed', 'rotation'];
+    }
+
+    function roomGameFieldsUnchanged() {
+      return request.resource.data.hostId == resource.data.hostId
+        && request.resource.data.roomCode == resource.data.roomCode
+        && request.resource.data.selectedPackIds == resource.data.selectedPackIds
+        && request.resource.data.settings == resource.data.settings
+        && request.resource.data.questionOrder == resource.data.questionOrder;
+    }
+
+    // ── quizPacks ────────────────────────────────────────────
+    // パック ID が共有の鍵。認証済みユーザーなら誰でも read 可（友達パック合成用）。
+
+    match /quizPacks/{packId} {
+      allow read: if authed();
+
+      allow create: if authed()
+        && request.resource.data.keys().hasAll(['title', 'createdBy', 'createdAt', 'updatedAt'])
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 80;
+
+      allow update: if authed()
+        && resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 80;
+
+      allow delete: if authed() && resource.data.createdBy == request.auth.uid;
+
+      match /questions/{questionId} {
+        allow read: if authed();
+
+        allow create, update: if authed()
+          && get(/databases/$(database)/documents/quizPacks/$(packId)).data.createdBy == request.auth.uid
+          && validQuestionText(request.resource.data.questionText)
+          && validQuestionText(request.resource.data.answerText);
+
+        allow delete: if authed()
+          && get(/databases/$(database)/documents/quizPacks/$(packId)).data.createdBy == request.auth.uid;
+      }
+    }
+
+    // ── roomCodes ────────────────────────────────────────────
+    // 参加時の roomCode → roomId ルックアップ用。
+
+    match /roomCodes/{code} {
+      allow read: if authed();
+
+      allow create: if authed()
+        && request.resource.data.keys().hasAll(['roomId'])
+        && request.resource.data.roomId is string
+        && request.resource.data.roomId.size() > 0;
+
+      allow update, delete: if false;
+    }
+
+    // ── rooms ────────────────────────────────────────────────
+
+    match /rooms/{roomId} {
+      // 参加前: roomCodes 経由で roomId を知った authenticated ユーザーも waiting ルームを read 可
+      allow read: if authed()
+        && (isMember(roomId) || resource.data.status == 'waiting');
+
+      allow create: if authed()
+        && request.resource.data.hostId == request.auth.uid
+        && request.resource.data.status == 'waiting'
+        && request.resource.data.phase == 'waiting'
+        && request.resource.data.roomCode is string
+        && request.resource.data.roomCode.size() == 6
+        && request.resource.data.selectedPackIds is list
+        && validRoomSettings(request.resource.data.settings)
+        && request.resource.data.questionIndex == 0
+        && request.resource.data.questionOrder is list
+        && request.resource.data.questionOrder.size() == 0
+        && request.resource.data.currentQuestionerId == null
+        && request.resource.data.currentQuestionId == null
+        && request.resource.data.buzzWinnerId == null
+        && request.resource.data.buzzedAt == null;
+
+      // ホスト: ゲーム開始（waiting → playing）
+      allow update: if isHost(roomId)
+        && resource.data.status == 'waiting'
+        && request.resource.data.status == 'playing'
+        && request.resource.data.phase == 'reading'
+        && request.resource.data.questionOrder is list
+        && request.resource.data.questionOrder.size() > 0
+        && request.resource.data.questionOrder.size() <= request.resource.data.settings.totalQuestions
+        && request.resource.data.hostId == resource.data.hostId
+        && request.resource.data.roomCode == resource.data.roomCode
+        && request.resource.data.selectedPackIds == resource.data.selectedPackIds
+        && request.resource.data.settings == resource.data.settings;
+
+      // 回答者: 早押し（reading → buzzed）
+      allow update: if isMember(roomId)
+        && resource.data.status == 'playing'
+        && resource.data.phase == 'reading'
+        && resource.data.buzzWinnerId == null
+        && request.resource.data.status == 'playing'
+        && request.resource.data.phase == 'buzzed'
+        && request.resource.data.buzzWinnerId == request.auth.uid
+        && request.resource.data.buzzedAt != null
+        && roomGameFieldsUnchanged()
+        && request.resource.data.questionIndex == resource.data.questionIndex
+        && request.resource.data.currentQuestionerId == resource.data.currentQuestionerId
+        && request.resource.data.currentQuestionId == resource.data.currentQuestionId;
+
+      // 出題者: 正誤判定（buzzed → judged）
+      allow update: if isQuestioner(roomId)
+        && resource.data.status == 'playing'
+        && resource.data.phase == 'buzzed'
+        && request.resource.data.status == 'playing'
+        && request.resource.data.phase == 'judged'
+        && roomGameFieldsUnchanged()
+        && request.resource.data.questionIndex == resource.data.questionIndex
+        && request.resource.data.buzzWinnerId == resource.data.buzzWinnerId
+        && request.resource.data.currentQuestionerId == resource.data.currentQuestionerId
+        && request.resource.data.currentQuestionId == resource.data.currentQuestionId;
+
+      // 出題者: 次の問題（judged → reading）または終了（judged → finished）
+      allow update: if isQuestioner(roomId)
+        && resource.data.status == 'playing'
+        && resource.data.phase == 'judged'
+        && (
+          (
+            request.resource.data.status == 'playing'
+            && request.resource.data.phase == 'reading'
+            && request.resource.data.buzzWinnerId == null
+            && request.resource.data.buzzedAt == null
+            && request.resource.data.questionIndex == resource.data.questionIndex + 1
+          )
+          || (
+            request.resource.data.status == 'finished'
+            && request.resource.data.phase == 'finished'
+            && request.resource.data.questionIndex == resource.data.questionIndex
+          )
+        )
+        && request.resource.data.hostId == resource.data.hostId
+        && request.resource.data.roomCode == resource.data.roomCode
+        && request.resource.data.selectedPackIds == resource.data.selectedPackIds
+        && request.resource.data.settings == resource.data.settings
+        && request.resource.data.questionOrder == resource.data.questionOrder;
+
+      allow delete: if false;
+
+      // ── members ──────────────────────────────────────────
+      // memberId === auth.uid を前提（ゲストは Anonymous Auth）
+
+      match /members/{memberId} {
+        // 参加前: joinOrder 取得・自分の doc 確認のため waiting ルームは read 可
+        allow read: if isMember(roomId) || isWaitingRoom(roomId);
+
+        allow create: if authed()
+          && memberId == request.auth.uid
+          && exists(/databases/$(database)/documents/rooms/$(roomId))
+          && roomData(roomId).status == 'waiting'
+          && request.resource.data.keys().hasAll(['name', 'uid', 'score', 'correctCount', 'joinOrder', 'joinedAt'])
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.name.size() <= 12
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.score == 0
+          && request.resource.data.correctCount == 0
+          && request.resource.data.joinOrder is int
+          && request.resource.data.joinOrder >= 0;
+
+        // 自分の表示名（ロビー中のみ）
+        allow update: if authed()
+          && memberId == request.auth.uid
+          && roomData(roomId).status == 'waiting'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name'])
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.name.size() <= 12;
+
+        // 出題者: 早押し成功者の得点更新（judge Transaction 内）
+        allow update: if isQuestioner(roomId)
+          && roomData(roomId).status == 'playing'
+          && roomData(roomId).phase == 'buzzed'
+          && memberId == roomData(roomId).buzzWinnerId
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['score', 'correctCount'])
+          && request.resource.data.score is int
+          && request.resource.data.correctCount is int
+          && request.resource.data.correctCount >= resource.data.correctCount
+          && request.resource.data.correctCount <= resource.data.correctCount + 1;
+
+        allow delete: if false;
+      }
+
+      // ── sessionQuestions ─────────────────────────────────
+
+      match /sessionQuestions/{questionId} {
+        allow read: if isMember(roomId);
+
+        allow create: if isMember(roomId)
+          && roomData(roomId).status == 'waiting'
+          && request.resource.data.keys().hasAll(['questionText', 'answerText', 'addedBy', 'createdAt'])
+          && validQuestionText(request.resource.data.questionText)
+          && validQuestionText(request.resource.data.answerText)
+          && request.resource.data.addedBy == request.auth.uid;
+
+        allow update, delete: if false;
+      }
+    }
+  }
+}

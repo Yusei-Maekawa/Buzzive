@@ -1,0 +1,39 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background: #0e0b16;
+    -webkit-font-smoothing: antialiased;
+    font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+  }
+  /* mobile-first frame backdrop */
+  #root {
+    display: flex;
+    justify-content: center;
+  }
+}
+
+@layer utilities {
+  .font-display {
+    font-family: 'Clash Display', system-ui, sans-serif;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .grain {
+    background-image: radial-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+    background-size: 4px 4px;
+  }
+}
